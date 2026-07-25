@@ -1,0 +1,169 @@
+# Build pipeline for Railed. Lives on this PUBLIC repo so iOS builds run on
+# GitHub's free macos runners and consume neither private-repo Actions
+# minutes nor EAS build credits (eas build --local).
+#
+# Flow: checkout arksigma/railed at the given ref -> eas build --local ->
+# upload .ipa/.aab artifact -> optionally eas submit (TestFlight / Play).
+#
+# Triggers:
+#   - repository_dispatch type "build" with {"ref": "vX.Y.Z"} and optional
+#     "platform" (ios|android|all, default ios) and "submit" ("true"/"false")
+#   - workflow_dispatch (manual or recovery runs)
+#
+# Secrets required on THIS repo:
+#   SOURCE_CHECKOUT_TOKEN  - PAT, read access to arksigma/railed
+#   EXPO_TOKEN             - expo.dev token (remote credential resolution)
+#   ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8_BASE64 - App Store Connect API key
+#   GOOGLE_PLAY_KEY_JSON   - Play service account key (android submit)
+
+name: build
+
+on:
+  repository_dispatch:
+    types: [build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source ref to build (tag vX.Y.Z or branch)"
+        required: true
+        default: "master"
+      platform:
+        description: "Platform(s) to build"
+        type: choice
+        options: ["ios", "android", "all"]
+        default: "ios"
+      submit:
+        description: "Submit after build (TestFlight / Play beta)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ref || github.event.client_payload.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_REF: ${{ inputs.ref || github.event.client_payload.ref }}
+  SUBMIT: ${{ inputs.submit || github.event.client_payload.submit || 'false' }}
+
+jobs:
+  ios:
+    if: ${{ (inputs.platform || github.event.client_payload.platform || 'ios') != 'android' }}
+    runs-on: macos-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: arksigma/railed
+          ref: ${{ env.BUILD_REF }}
+          token: ${{ secrets.SOURCE_CHECKOUT_TOKEN }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Guard version drift (tag builds only)
+        if: ${{ startsWith(env.BUILD_REF, 'v') }}
+        run: |
+          app_version="$(node -p "require('./app.json').expo.version")"
+          tag_version="${BUILD_REF#v}"
+          if [ "$tag_version" != "$app_version" ]; then
+            echo "tag $BUILD_REF does not match app.json version $app_version" >&2
+            exit 1
+          fi
+
+      - name: Build iOS (eas build --local)
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          npx --yes eas-cli@latest build --platform ios --profile production \
+            --local --non-interactive --output "$RUNNER_TEMP/raild.ipa"
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raild-ios-${{ env.BUILD_REF }}
+          path: ${{ runner.temp }}/raild.ipa
+          if-no-files-found: error
+
+      - name: Submit to TestFlight
+        if: ${{ env.SUBMIT == 'true' }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_API_KEY_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 -d > AuthKey_Railed.p8
+          npx --yes eas-cli@latest submit --platform ios --profile production \
+            --path "$RUNNER_TEMP/raild.ipa" --non-interactive
+          rm -f AuthKey_Railed.p8
+
+  android:
+    if: ${{ (inputs.platform || github.event.client_payload.platform || 'ios') != 'ios' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: arksigma/railed
+          ref: ${{ env.BUILD_REF }}
+          token: ${{ secrets.SOURCE_CHECKOUT_TOKEN }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Guard version drift (tag builds only)
+        if: ${{ startsWith(env.BUILD_REF, 'v') }}
+        run: |
+          app_version="$(node -p "require('./app.json').expo.version")"
+          tag_version="${BUILD_REF#v}"
+          if [ "$tag_version" != "$app_version" ]; then
+            echo "tag $BUILD_REF does not match app.json version $app_version" >&2
+            exit 1
+          fi
+
+      - name: Build Android (eas build --local)
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          npx --yes eas-cli@latest build --platform android --profile production \
+            --local --non-interactive --output "$RUNNER_TEMP/raild.aab"
+
+      - name: Upload .aab artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raild-android-${{ env.BUILD_REF }}
+          path: ${{ runner.temp }}/raild.aab
+          if-no-files-found: error
+
+      - name: Submit to Play (beta track)
+        if: ${{ env.SUBMIT == 'true' }}
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          GOOGLE_PLAY_KEY_JSON: ${{ secrets.GOOGLE_PLAY_KEY_JSON }}
+        run: |
+          printf '%s' "$GOOGLE_PLAY_KEY_JSON" > raild-eas-key.json
+          npx --yes eas-cli@latest submit --platform android --profile beta \
+            --path "$RUNNER_TEMP/raild.aab" --non-interactive
+          rm -f raild-eas-key.json
