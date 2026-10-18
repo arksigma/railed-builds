@@ -15,6 +15,18 @@
 #   EXPO_TOKEN             - expo.dev token (remote credential resolution)
 #   ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_P8_BASE64 - App Store Connect API key
 #   GOOGLE_PLAY_KEY_JSON   - Play service account key (android submit)
+#
+# A TAG BUILD THAT DOES NOT SUBMIT IS A FAILURE, not a success. The submit
+# steps below are gated on SUBMIT == 'true', and a skipped step does not fail a
+# run -- so v1.1.33, v1.1.34, v1.1.35 and v1.1.36 each built a good .ipa,
+# uploaded it as an artifact, skipped the submit step and reported green. iOS
+# stayed on 1.1.31 from 6 August to 18 October while Android shipped five
+# versions, and nothing alerted because nothing had failed. The dispatcher now
+# sends submit=true (arksigma/railed#6); the guard at the end of each job below
+# is what makes the next omission visible instead of silent.
+#
+# To build a tag deliberately without submitting it, pass allow_no_submit=true.
+# That is the whole escape hatch: say so, and the run stays green.
 
 name: build
 
@@ -37,6 +49,11 @@ on:
         type: choice
         options: ["false", "true"]
         default: "false"
+      allow_no_submit:
+        description: "Build a tag without submitting it (suppresses the guard)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
 
 permissions:
   contents: read
@@ -48,6 +65,9 @@ concurrency:
 env:
   BUILD_REF: ${{ inputs.ref || github.event.client_payload.ref }}
   SUBMIT: ${{ inputs.submit || github.event.client_payload.submit || 'false' }}
+  # Deliberate opt-out of the tag-must-submit guard. Defaults the same way
+  # SUBMIT does, so an absent key means 'false' and the guard stays armed.
+  ALLOW_NO_SUBMIT: ${{ inputs.allow_no_submit || github.event.client_payload.allow_no_submit || 'false' }}
 
 jobs:
   ios:
@@ -106,6 +126,15 @@ jobs:
           npx --yes eas-cli@latest submit --platform ios --profile production \
             --path "$RUNNER_TEMP/raild.ipa" --non-interactive
           rm -f AuthKey_Railed.p8
+
+      - name: Guard - a tag build must submit
+        if: ${{ startsWith(env.BUILD_REF, 'v') && env.SUBMIT != 'true' && env.ALLOW_NO_SUBMIT != 'true' }}
+        run: |
+          echo "::error::$BUILD_REF built an .ipa and never submitted it. SUBMIT was '$SUBMIT'." >&2
+          echo "The binary is attached to this run as artifact raild-ios-$BUILD_REF, so nothing is lost." >&2
+          echo "Re-run with submit=true to send it to App Store Connect, or pass" >&2
+          echo "allow_no_submit=true if building this tag without submitting was the intent." >&2
+          exit 1
 
   android:
     if: ${{ (inputs.platform || github.event.client_payload.platform || 'ios') != 'ios' }}
@@ -167,3 +196,12 @@ jobs:
           npx --yes eas-cli@latest submit --platform android --profile beta \
             --path "$RUNNER_TEMP/raild.aab" --non-interactive
           rm -f raild-eas-key.json
+
+      - name: Guard - a tag build must submit
+        if: ${{ startsWith(env.BUILD_REF, 'v') && env.SUBMIT != 'true' && env.ALLOW_NO_SUBMIT != 'true' }}
+        run: |
+          echo "::error::$BUILD_REF built an .aab and never submitted it. SUBMIT was '$SUBMIT'." >&2
+          echo "The binary is attached to this run as artifact raild-android-$BUILD_REF, so nothing is lost." >&2
+          echo "Re-run with submit=true to send it to the Play beta track, or pass" >&2
+          echo "allow_no_submit=true if building this tag without submitting was the intent." >&2
+          exit 1
